@@ -1,0 +1,43 @@
+name: Native numerical invariant check
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  numerics:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare isolated build target
+        run: |
+          mkdir -p research-ci
+          cat > research-ci/probe.cc <<'CPP'
+          #include "G4SimpleIntegration.hh"
+          #include <cmath>
+          #include <iostream>
+          double linear(double x) { return x; }
+          int main() {
+            G4SimpleIntegration q(linear);
+            int failed = 0;
+            for (double a : {0., 1., 2., -2.}) {
+              for (int n : {1, 8, 64}) {
+                double b = a + 1.;
+                double expected = (b*b-a*a)/2.;
+                double actual = q.Gauss(a,b,n);
+                bool pass = std::abs(actual-expected) < 1e-12;
+                std::cout << "a=" << a << " n=" << n << " expected=" << expected
+                          << " actual=" << actual << " " << (pass?"PASS":"FAIL") << std::endl;
+                failed += !pass;
+              }
+            }
+            return failed ? 1 : 0;
+          }
+          CPP
+          printf '\nadd_executable(g4_numerics_probe research-ci/probe.cc)\ntarget_link_libraries(g4_numerics_probe PRIVATE G4global)\n' >> CMakeLists.txt
+      - name: Configure and build native target
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGEANT4_INSTALL_DATA=OFF
+          cmake --build build --target g4_numerics_probe --parallel 2
+      - name: Run numerical invariant check
+        run: ./build/g4_numerics_probe
