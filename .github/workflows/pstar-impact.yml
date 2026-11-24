@@ -1,0 +1,11 @@
+name: PSTAR stopping and deposition sensitivity
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  research_branch_only:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo 'Dispatch this workflow on research/spline-coefficient-correction, not main.'
+      - run: exit 1
