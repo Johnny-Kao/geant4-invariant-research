@@ -1,0 +1,61 @@
+name: Physics vector numerical contract
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  numerics:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add native numerical probe
+        run: |
+          mkdir -p research-ci
+          cat > research-ci/physics_vector.cc <<'CPP'
+          #include "G4PhysicsFreeVector.hh"
+          #include "G4PhysicsLinearVector.hh"
+          #include "G4PhysicsLogVector.hh"
+          #include <cmath>
+          #include <iostream>
+          #include <vector>
+          int main() {
+            int pass=0, fail=0;
+            auto check=[&](const char* name,double x,double actual,double expected) {
+              bool ok=std::isfinite(actual)&&std::abs(actual-expected)<1e-9*std::max(1.,std::abs(expected));
+              std::cout << name << " x=" << x << " actual=" << actual << " expected=" << expected << " " << (ok?"PASS":"FAIL") << '\n';
+              ok?++pass:++fail;
+            };
+            for (const auto& xs : {std::vector<double>{1,2,3,4,5,6},std::vector<double>{1,1.5,3,4,7,9}}) {
+              std::vector<double> ys;
+              for(auto x:xs) ys.push_back(x*x);
+              G4PhysicsFreeVector base(xs,ys,true), fixed(xs,ys,true), linear(xs,ys,false);
+              base.FillSecondDerivatives();
+              fixed.FillSecondDerivatives(G4SplineType::FixedEdges,2*xs.front(),2*xs.back());
+              for(std::size_t i=0;i+1<xs.size();++i) {
+                double x=(xs[i]+xs[i+1])/2;
+                check("base quadratic",x,base.Value(x),x*x);
+                check("fixed quadratic",x,fixed.Value(x),x*x);
+                check("linear control",x,linear.Value(x),(ys[i]+ys[i+1])/2);
+                std::size_t hint=0;
+                check("cached lookup",x,base.Value(x,hint),base.Value(x));
+              }
+              for(auto x:xs) check("table node",x,base.Value(x),x*x);
+              G4PhysicsFreeVector scaled(base);
+              scaled.ScaleVector(2.,3.);
+              for(std::size_t i=0;i+1<xs.size();++i) {
+                double x=(xs[i]+xs[i+1])/2;
+                check("scale covariance",x,scaled.Value(2*x),3*base.Value(x));
+              }
+            }
+            std::cout << "SUMMARY PASS=" << pass << " FAIL=" << fail << '\n';
+            return fail?1:0;
+          }
+          CPP
+          printf '\nadd_executable(g4_physics_vector_probe research-ci/physics_vector.cc)\ntarget_link_libraries(g4_physics_vector_probe PRIVATE G4global)\n' >> CMakeLists.txt
+      - name: Build native G4global
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGEANT4_INSTALL_DATA=OFF
+          cmake --build build --target g4_physics_vector_probe --parallel 2
+      - name: Evaluate numerical contracts
+        run: ./build/BuildProducts/bin/g4_physics_vector_probe
