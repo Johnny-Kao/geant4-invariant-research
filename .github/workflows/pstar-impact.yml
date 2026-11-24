@@ -1,0 +1,170 @@
+name: PSTAR stopping and deposition sensitivity
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  spline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Prepare reference and production table
+        run: |
+          mkdir -p research-ci
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          root=Path("source/processes/electromagnetic/standard")
+          header=(root/"include/G4NISTStoppingData.hh").read_text()
+          src=(root/"src/G4PSTARStopping.cc").read_text()
+          x=re.search(r'T0\s*\[\s*\d+\s*\]\s*=\s*\{([^}]+)\}',header,re.S).group(1)
+          xs=[v.strip().split('*')[0].strip() for v in x.split(',') if v.strip()][:60]
+          assert len(xs)==60
+          tables=re.findall(r'static\s+const\s+G4float\s+e(\d+)\s*\[\s*60\s*\]\s*=\s*\{([^}]+)\}',src,re.S)
+          assert sorted(int(i) for i,_ in tables)==list(range(74))
+          out=["const std::vector<double> pstar_x={"+",".join(xs)+"};","const std::vector<std::vector<double>> pstar_tables={"]
+          for i,y in sorted(tables,key=lambda t:int(t[0])):
+            ys=[v.strip() for v in y.split(',') if v.strip()]
+            assert len(ys)==60
+            out.append("{"+",".join("double("+v+")" for v in ys)+"},")
+          out.append("};")
+          Path("research-ci/pstar_data.hh").write_text("\n".join(out)+"\n")
+          PY
+          cat > research-ci/spline_reference.cc <<'CPP'
+          #include "G4PhysicsFreeVector.hh"
+          #include <algorithm>
+          #include <cmath>
+          #include <iomanip>
+          #include <iostream>
+          #include <stdexcept>
+          #include <vector>
+          #include "pstar_data.hh"
+          constexpr double cutoff=0.00025;
+          struct Model {
+            G4PhysicsFreeVector v;
+            int subdivisions;
+            std::vector<double> x, r;
+            Model(const std::vector<double>& y,int n):v(pstar_x,y,true),subdivisions(n){
+              v.FillSecondDerivatives();
+              v.EnableLogBinSearch(2);
+              x.push_back(cutoff); r.push_back(0.);
+              std::vector<double> edges{cutoff};
+              for(double t:pstar_x) if(t>cutoff&&t<=2.)edges.push_back(t);
+              for(size_t i=1;i<edges.size();++i) {
+                for(int j=1;j<=n;++j){
+                  double t=edges[i-1]+(edges[i]-edges[i-1])*j/n;
+                  r.push_back(r.back()+integral(x.back(),t));x.push_back(t);
+                }
+              }
+            }
+            double s(double e)const{
+              double val=e<pstar_x.front()?v[0]*std::sqrt(e/pstar_x.front()):v.Value(e);
+              if(!(val>0.)||!std::isfinite(val))throw std::runtime_error("nonpositive stopping power");
+              return val;
+            }
+            double integral(double a,double b)const{
+              double m=(a+b)/2;
+              return (b-a)/6*(1/s(a)+4/s(m)+1/s(b));
+            }
+            double range(double e)const{
+              if(e<=cutoff)return 0;
+              auto it=std::upper_bound(x.begin(),x.end(),e);
+              size_t i=std::min(size_t(it-x.begin()-1),x.size()-1);
+              return r[i]+integral(x[i],e);
+            }
+            double residual(double distance,double e0)const{
+              double target=range(e0)-distance;
+              if(target<=0)return 0.;
+              auto it=std::upper_bound(r.begin(),r.end(),target);
+              size_t i=size_t(it-r.begin()-1);
+              double lo=x[i],hi=x[i+1];
+              for(int k=0;k<48;++k){double m=(lo+hi)/2;if(r[i]+integral(x[i],m)<target)lo=m;else hi=m;}
+              return (lo+hi)/2;
+            }
+          };
+          int main(){
+            std::cout<<std::setprecision(17);
+            for(size_t i=0;i<pstar_tables.size();++i){
+              Model coarse(pstar_tables[i],64),fine(pstar_tables[i],128);
+              for(double e:{0.00125,0.002,0.01,0.1,1.,2.}){
+                double range=fine.range(e),err=std::abs(range-coarse.range(e))/range;
+                if(err>1e-8)throw std::runtime_error("quadrature convergence");
+                std::cout<<"R "<<i<<" "<<e<<" "<<range<<" "<<err<<"\n";
+              }
+              // Use a fixed common depth axis, defined by the first-order table integration.
+              // The Python comparison uses the same absolute depths for both variants.
+              for(double e:{0.002,0.01,0.1,1.,2.}){
+                double ref=0.; double prev=cutoff;
+                for(double next:pstar_x){
+                  double end=std::min(e,next);
+                  if(end>prev){
+                    auto lin=[&](double t){if(t<pstar_x.front())return fine.v[0]*std::sqrt(t/pstar_x.front());auto it=std::upper_bound(pstar_x.begin(),pstar_x.end(),t);size_t j=std::min(size_t(it-pstar_x.begin()-1),pstar_x.size()-2);return pstar_tables[i][j]+(pstar_tables[i][j+1]-pstar_tables[i][j])*(t-pstar_x[j])/(pstar_x[j+1]-pstar_x[j]);};
+                    ref+=(end-prev)/6*(1/lin(prev)+4/lin((prev+end)/2)+1/lin(end));
+                    prev=end;
+                  }
+                  if(next>=e)break;
+                }
+                double before=e,sum=0.;
+                for(int j=1;j<=110;++j){
+                  double depth=ref*j/100., after=fine.residual(depth,e),dep=before-after;
+                  if(dep< -1e-14)throw std::runtime_error("negative deposition");
+                  sum+=dep;
+                  std::cout<<"D "<<i<<" "<<e<<" "<<j<<" "<<depth<<" "<<dep<<"\n";
+                  before=after;
+                }
+                std::cout<<"C "<<i<<" "<<e<<" "<<sum+before-e<<" "<<before<<"\n";
+                if(std::abs(sum+before-e)>1e-12||before!=0.)throw std::runtime_error("energy balance or depth coverage");
+              }
+            }
+          }
+          CPP
+          printf '\nadd_executable(g4_spline_reference research-ci/spline_reference.cc)\ntarget_link_libraries(g4_spline_reference PRIVATE G4global)\n' >> CMakeLists.txt
+      - name: Build and compare unmodified baseline
+        run: |
+          file=source/global/management/src/G4PhysicsVector.cc
+          cp "$file" "$RUNNER_TEMP/patched.cc"
+          git show 044ac690985b37068b83a4ff97a04a734e83ccd5:"$file" > "$file"
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGEANT4_INSTALL_DATA=OFF
+          cmake --build build --target g4_spline_reference --parallel 2
+          ./build/BuildProducts/bin/g4_spline_reference > "$RUNNER_TEMP/baseline.txt"
+      - name: Build and compare candidate
+        run: |
+          cp "$RUNNER_TEMP/patched.cc" source/global/management/src/G4PhysicsVector.cc
+          cmake --build build --target g4_spline_reference --parallel 2
+          ./build/BuildProducts/bin/g4_spline_reference > "$RUNNER_TEMP/candidate.txt"
+      - name: Summarize common-depth comparisons
+        run: |
+          python3 - <<'PY'
+          import os,statistics
+          from pathlib import Path
+          def read(name):
+              out={}
+              for line in (Path(os.environ["RUNNER_TEMP"])/name).read_text().splitlines():
+                  p=line.split()
+                  if p[0]=="R":out[("R",int(p[1]),float(p[2]))]=(float(p[3]),float(p[4]))
+                  if p[0]=="D":out[("D",int(p[1]),float(p[2]),int(p[3]))]=(float(p[4]),float(p[5]))
+                  if p[0]=="C":out[("C",int(p[1]),float(p[2]))]=(float(p[3]),float(p[4]))
+              return out
+          b,p=read("baseline.txt"),read("candidate.txt")
+          assert b.keys()==p.keys()
+          for e in [0.00125,0.002,0.01,0.1,1.,2.]:
+              delta=[100*(b["R",i,e][0]/p["R",i,e][0]-1) for i in range(74)]
+              print("RANGE E_MeV",e,"min_pct",min(delta),"median_pct",statistics.median(delta),"max_pct",max(delta),"max_abs_pct",max(map(abs,delta)))
+          for e in [0.002,0.01,0.1,1.,2.]:
+              tv=[];local=[];maxidx=None
+              for i in range(74):
+                  differences=[]
+                  for j in range(1,111):
+                      a,d=b["D",i,e,j],p["D",i,e,j]
+                      assert a[0]==d[0]
+                      differences.append(abs(a[1]-d[1]))
+                  tv.append(100*sum(differences)/(2*e))
+                  local.append(100*max(differences)/e)
+              print("DEPOSITION E_MeV",e,"median_redistributed_pct",statistics.median(tv),"max_redistributed_pct",max(tv),"max_single_bin_pct_initial_energy",max(local))
+          for tag,data in [("baseline",b),("candidate",p)]:
+              print("BALANCE",tag,"max_abs_MeV",max(abs(v[0]) for k,v in data.items() if k[0]=="C"),"max_residual_MeV",max(abs(v[1]) for k,v in data.items() if k[0]=="C"))
+          print("CONVERGENCE max_relative",max(v[1] for data in [b,p] for k,v in data.items() if k[0]=="R"))
+          PY
