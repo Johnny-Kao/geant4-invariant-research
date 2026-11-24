@@ -40,4 +40,4 @@ jobs:
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGEANT4_INSTALL_DATA=OFF
           cmake --build build --target g4_numerics_probe --parallel 2
       - name: Run numerical invariant check
-        run: ./build/g4_numerics_probe
+        run: ./build/BuildProducts/bin/g4_numerics_probe
