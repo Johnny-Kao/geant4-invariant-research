@@ -317,17 +317,15 @@ void G4PhysicsVector::ComputeSecDerivative1()
   auto u = new G4double[n];
   G4double p, sig;
 
-  u[1] = ((dataVector[2] - dataVector[1]) / (binVector[2] - binVector[1])
-          - (dataVector[1] - dataVector[0]) / (binVector[1] - binVector[0]));
-  u[1] = 6.0 * u[1] * (binVector[2] - binVector[1])
-         / ((binVector[2] - binVector[0]) * (binVector[2] - binVector[0]));
+  // Eliminate the endpoint derivatives using the not-a-knot conditions.
+  const G4double h0 = binVector[1] - binVector[0];
+  const G4double h1 = binVector[2] - binVector[1];
+  secDerivative[1] = (h0 - h1) / (h0 + 2.0 * h1);
+  u[1] = 6.0 * ((dataVector[2] - dataVector[1]) / h1
+                - (dataVector[1] - dataVector[0]) / h0)
+         * h1 / ((h0 + h1) * (h0 + 2.0 * h1));
 
-  // Decomposition loop for tridiagonal algorithm. secDerivative[i]
-  // and u[i] are used for temporary storage of the decomposed factors.
-
-  secDerivative[1] = (2.0 * binVector[1] - binVector[0] - binVector[2])
-                     / (2.0 * binVector[2] - binVector[0] - binVector[1]);
-
+  // Decompose the reduced tridiagonal system.
   for (std::size_t i = 2; i < n - 1; ++i)
   {
     sig = (binVector[i] - binVector[i - 1]) / (binVector[i + 1] - binVector[i - 1]);
@@ -335,32 +333,25 @@ void G4PhysicsVector::ComputeSecDerivative1()
     secDerivative[i] = (sig - 1.0) / p;
     u[i] = (dataVector[i + 1] - dataVector[i]) / (binVector[i + 1] - binVector[i])
            - (dataVector[i] - dataVector[i - 1]) / (binVector[i] - binVector[i - 1]);
-    u[i] = (6.0 * u[i] / (binVector[i + 1] - binVector[i - 1])) - sig * u[i - 1] / p;
+    u[i] = (6.0 * u[i] / (binVector[i + 1] - binVector[i - 1]) - sig * u[i - 1]) / p;
   }
 
-  sig = (binVector[n - 1] - binVector[n - 2]) / (binVector[n] - binVector[n - 2]);
-  p = sig * secDerivative[n - 3] + 2.0;
-  u[n - 1] = (dataVector[n] - dataVector[n - 1]) / (binVector[n] - binVector[n - 1])
-             - (dataVector[n - 1] - dataVector[n - 2]) / (binVector[n - 1] - binVector[n - 2]);
-  u[n - 1] =
-    6.0 * sig * u[n - 1] / (binVector[n] - binVector[n - 2]) - (2.0 * sig - 1.0) * u[n - 2] / p;
+  const G4double hl = binVector[n - 1] - binVector[n - 2];
+  const G4double hr = binVector[n] - binVector[n - 1];
+  sig = hl / (hl + hr);
+  p = 1.0 + sig + (2.0 * sig - 1.0) * secDerivative[n - 2];
+  u[n - 1] = (dataVector[n] - dataVector[n - 1]) / hr
+             - (dataVector[n - 1] - dataVector[n - 2]) / hl;
+  secDerivative[n - 1] =
+    (6.0 * sig * u[n - 1] / (hl + hr) - (2.0 * sig - 1.0) * u[n - 2]) / p;
 
-  p = (1.0 + sig) + (2.0 * sig - 1.0) * secDerivative[n - 2];
-  secDerivative[n - 1] = u[n - 1] / p;
-
-  // The back-substitution loop for the triagonal algorithm of solving
-  // a linear system of equations.
-
-  for (std::size_t k = n - 2; k > 1; --k)
+  // Back-substitute, then recover the eliminated endpoints.
+  for (std::size_t k = n - 2; k > 0; --k)
   {
-    secDerivative[k] *=
-      (secDerivative[k + 1]
-       - u[k] * (binVector[k + 1] - binVector[k - 1]) / (binVector[k + 1] - binVector[k]));
+    secDerivative[k] = secDerivative[k] * secDerivative[k + 1] + u[k];
   }
-  secDerivative[n] = (secDerivative[n - 1] - (1.0 - sig) * secDerivative[n - 2]) / sig;
-  sig = 1.0 - ((binVector[2] - binVector[1]) / (binVector[2] - binVector[0]));
-  secDerivative[1] *= (secDerivative[2] - u[1] / (1.0 - sig));
-  secDerivative[0] = (secDerivative[1] - sig * secDerivative[2]) / (1.0 - sig);
+  secDerivative[n] = ((hl + hr) * secDerivative[n - 1] - hr * secDerivative[n - 2]) / hl;
+  secDerivative[0] = ((h0 + h1) * secDerivative[1] - h0 * secDerivative[2]) / h1;
 
   delete[] u;
 }
