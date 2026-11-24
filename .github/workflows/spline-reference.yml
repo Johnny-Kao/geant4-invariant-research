@@ -9,6 +9,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Prepare reference and production table
         run: |
           mkdir -p research-ci
@@ -19,11 +21,17 @@ jobs:
           header=(root/"include/G4NISTStoppingData.hh").read_text()
           src=(root/"src/G4PSTARStopping.cc").read_text()
           x=re.search(r'T0\s*\[\s*\d+\s*\]\s*=\s*\{([^}]+)\}',header,re.S).group(1)
-          y=re.search(r'e0\s*\[\s*60\s*\]\s*=\s*\{([^}]+)\}',src,re.S).group(1)
           xs=[v.strip().split('*')[0].strip() for v in x.split(',') if v.strip()][:60]
-          ys=[v.strip() for v in y.split(',') if v.strip()]
-          assert len(xs)==len(ys)==60
-          Path("research-ci/pstar_data.hh").write_text("const std::vector<double> pstar_x={"+",".join(xs)+"};\nconst std::vector<double> pstar_y={"+",".join("double("+v+")" for v in ys)+"};\n")
+          assert len(xs)==60
+          tables=re.findall(r'static\s+const\s+G4float\s+e(\d+)\s*\[\s*60\s*\]\s*=\s*\{([^}]+)\}',src,re.S)
+          assert sorted(int(i) for i,_ in tables)==list(range(74))
+          out=["const std::vector<double> pstar_x={"+",".join(xs)+"};","const std::vector<std::vector<double>> pstar_tables={"]
+          for i,y in sorted(tables,key=lambda t:int(t[0])):
+            ys=[v.strip() for v in y.split(',') if v.strip()]
+            assert len(ys)==60
+            out.append("{"+",".join("double("+v+")" for v in ys)+"},")
+          out.append("};")
+          Path("research-ci/pstar_data.hh").write_text("\n".join(out)+"\n")
           PY
           cat > research-ci/spline_reference.cc <<'CPP'
           #include "G4PhysicsFreeVector.hh"
@@ -80,20 +88,35 @@ jobs:
           }
           int main(){
             std::cout<<std::setprecision(15);
-            for(auto x:{V{1,2,3,4,5,6},V{1,1.5,3,4,7,9}})for(int d:{2,3}){
+            for(auto x:{V{1,2,3,4,5,6},V{1,1.5,3,4,7,9},V{1,2,3,4,5},V{1,1.25,3,7},V{0.001,0.0015,0.005,0.1,2.,7.}})for(int d:{2,3}){
               V y;for(double t:x)y.push_back(d==2?t*t:t*t*t);
-              check(d==2?"quadratic base":"cubic base",x,y,false,d);
+              if(x.size()>=5)check(d==2?"quadratic base":"cubic base",x,y,false,d);
               check(d==2?"quadratic fixed":"cubic fixed",x,y,true,d);
             }
-            check("PSTAR e0 base",pstar_x,pstar_y,false);
+            for(size_t i=0;i<pstar_tables.size();++i){
+              auto label="PSTAR e"+std::to_string(i)+" base";
+              check(label.c_str(),pstar_x,pstar_tables[i],false);
+            }
             std::cout<<"SUMMARY PASS="<<pass<<" FAIL="<<fail<<" ORACLE_FAIL="<<oracle_fail<<'\n';
             return oracle_fail?2:fail?1:0;
           }
           CPP
           printf '\nadd_executable(g4_spline_reference research-ci/spline_reference.cc)\ntarget_link_libraries(g4_spline_reference PRIVATE G4global)\n' >> CMakeLists.txt
-      - name: Build
+      - name: Build and compare unmodified baseline
         run: |
+          file=source/global/management/src/G4PhysicsVector.cc
+          cp "$file" "$RUNNER_TEMP/patched.cc"
+          git show 044ac690985b37068b83a4ff97a04a734e83ccd5:"$file" > "$file"
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGEANT4_INSTALL_DATA=OFF
           cmake --build build --target g4_spline_reference --parallel 2
-      - name: Compare
-        run: ./build/BuildProducts/bin/g4_spline_reference
+          set +e
+          ./build/BuildProducts/bin/g4_spline_reference | tee "$RUNNER_TEMP/baseline.txt"
+          rc=${PIPESTATUS[0]}
+          set -e
+          test "$rc" -eq 1
+          grep -q 'ORACLE_FAIL=0$' "$RUNNER_TEMP/baseline.txt"
+      - name: Build and compare candidate
+        run: |
+          cp "$RUNNER_TEMP/patched.cc" source/global/management/src/G4PhysicsVector.cc
+          cmake --build build --target g4_spline_reference --parallel 2
+          ./build/BuildProducts/bin/g4_spline_reference | tee "$RUNNER_TEMP/candidate.txt"
