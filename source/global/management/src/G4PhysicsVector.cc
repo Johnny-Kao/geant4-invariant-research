@@ -368,42 +368,32 @@ void G4PhysicsVector::ComputeSecDerivative2(G4double firstPointDerivative,
   auto u = new G4double[n];
   G4double p, sig, un;
 
-  u[0] = (6.0 / (binVector[1] - binVector[0]))
+  u[0] = (3.0 / (binVector[1] - binVector[0]))
          * ((dataVector[1] - dataVector[0]) / (binVector[1] - binVector[0]) - firstPointDerivative);
 
   secDerivative[0] = -0.5;
 
-  // Decomposition loop for tridiagonal algorithm. secDerivative[i]
-  // and u[i] are used for temporary storage of the decomposed factors.
-
+  // Decompose the tridiagonal system with fixed endpoint slopes.
   for (std::size_t i = 1; i < n; ++i)
   {
     sig = (binVector[i] - binVector[i - 1]) / (binVector[i + 1] - binVector[i - 1]);
-    p = sig * (secDerivative[i - 1]) + 2.0;
+    p = sig * secDerivative[i - 1] + 2.0;
     secDerivative[i] = (sig - 1.0) / p;
     u[i] = (dataVector[i + 1] - dataVector[i]) / (binVector[i + 1] - binVector[i])
            - (dataVector[i] - dataVector[i - 1]) / (binVector[i] - binVector[i - 1]);
-    u[i] = 6.0 * u[i] / (binVector[i + 1] - binVector[i - 1]) - sig * u[i - 1] / p;
+    u[i] = (6.0 * u[i] / (binVector[i + 1] - binVector[i - 1]) - sig * u[i - 1]) / p;
   }
 
-  sig = (binVector[n - 1] - binVector[n - 2]) / (binVector[n] - binVector[n - 2]);
-  p = sig * secDerivative[n - 2] + 2.0;
-  un = (6.0 / (binVector[n] - binVector[n - 1]))
-         * (endPointDerivative
-            - (dataVector[n] - dataVector[n - 1]) / (binVector[n] - binVector[n - 1]))
-       - u[n - 1] / p;
-  secDerivative[n] = un / (secDerivative[n - 1] + 2.0);
+  un = (3.0 / (binVector[n] - binVector[n - 1]))
+       * (endPointDerivative
+          - (dataVector[n] - dataVector[n - 1]) / (binVector[n] - binVector[n - 1]));
+  secDerivative[n] = (un - 0.5 * u[n - 1]) / (1.0 + 0.5 * secDerivative[n - 1]);
 
-  // The back-substitution loop for the triagonal algorithm of solving
-  // a linear system of equations.
-
-  for (std::size_t k = n - 1; k > 0; --k)
+  // Back-substitute to recover the second derivatives.
+  for (std::size_t k = n; k > 0; --k)
   {
-    secDerivative[k] *=
-      (secDerivative[k + 1]
-       - u[k] * (binVector[k + 1] - binVector[k - 1]) / (binVector[k + 1] - binVector[k]));
+    secDerivative[k - 1] = secDerivative[k - 1] * secDerivative[k] + u[k - 1];
   }
-  secDerivative[0] = 0.5 * (u[0] - secDerivative[1]);
 
   delete[] u;
 }
