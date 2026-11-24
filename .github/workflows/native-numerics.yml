@@ -14,6 +14,8 @@ jobs:
           mkdir -p research-ci
           cat > research-ci/probe.cc <<'CPP'
           #include "G4SimpleIntegration.hh"
+          #include "G4StatDouble.hh"
+          #include "G4DataInterpolation.hh"
           #include <cmath>
           #include <iostream>
           double linear(double x) { return x; }
@@ -30,6 +32,23 @@ jobs:
                           << " actual=" << actual << " " << (pass?"PASS":"FAIL") << std::endl;
                 failed += !pass;
               }
+            }
+            G4StatDouble direct(7.0), accumulated;
+            accumulated.fill(7.0);
+            bool stat = std::abs(direct.mean()-accumulated.mean()) < 1e-12;
+            std::cout << "stat constructor equivalence expected=" << accumulated.mean()
+                      << " actual=" << direct.mean() << " " << (stat?"PASS":"FAIL") << std::endl;
+            failed += !stat;
+            double x[] = {0., 1., 2., 3.}, y[] = {0., 1., 8., 27.};
+            double xr[] = {3., 2., 1., 0.}, yr[] = {27., 8., 1., 0.};
+            G4DataInterpolation asc(x,y,4,0.,27.), desc(xr,yr,4,27.,0.);
+            for (double t : {0.5, 1.5, 2.5}) {
+              double expected = t*t*t;
+              double a = asc.CubicSplineInterpolation(t), d = desc.CubicSplineInterpolation(t);
+              bool pass = std::abs(a-expected)<1e-12 && std::abs(d-expected)<1e-12;
+              std::cout << "spline x=" << t << " expected=" << expected << " asc=" << a
+                        << " desc=" << d << " " << (pass?"PASS":"FAIL") << std::endl;
+              failed += !pass;
             }
             return failed ? 1 : 0;
           }
