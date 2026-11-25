@@ -78,4 +78,4 @@ jobs:
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGEANT4_INSTALL_DATA=OFF
           cmake --build build --target round2 --parallel 4
       - name: Run invariants
-        run: ./build/round2
+        run: ./build/BuildProducts/bin/round2
