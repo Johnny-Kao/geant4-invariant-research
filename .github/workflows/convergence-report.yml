@@ -1,0 +1,102 @@
+name: Convergence reporting state invariants
+on:
+  push:
+    branches: [research/numerical-round2]
+    paths: ['.github/workflows/convergence-report.yml']
+permissions:
+  contents: read
+jobs:
+  report:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare focused native reporting test
+        run: |
+          mkdir -p research-ci
+          cat > research-ci/report.cc <<'CPP'
+          #include "G4ConvergenceTester.hh"
+          #include <cmath>
+          #include <iostream>
+          #include <regex>
+          #include <sstream>
+          #include <string>
+          int pass=0,fail=0;
+          void check(const char* name,bool ok){
+            std::cout<<name<<" "<<(ok?"PASS":"FAIL")<<'\n';
+            (ok?pass:fail)++;
+          }
+          int count(const std::string& s){
+            std::smatch m;
+            return std::regex_search(s,m,std::regex("This result passes ([0-9]+) /"))?std::stoi(m[1]):-1;
+          }
+          std::string report(G4ConvergenceTester& t){
+            std::ostringstream s;t.ShowResult(s);return s.str();
+          }
+          std::string history(G4ConvergenceTester& t){
+            std::ostringstream s;t.ShowHistory(s);return s.str();
+          }
+          bool lastRow(const std::string& s,int expectedIndex,double expectedMean){
+            std::istringstream rows(s);std::string line;
+            while(std::getline(rows,line)){
+              std::istringstream r(line);int bin,index;double mean;
+              if(r>>bin>>index>>mean && bin==16){
+                std::cout<<"last row "<<index<<" mean "<<mean<<" expected "<<expectedIndex<<" "<<expectedMean<<'\n';
+                return index==expectedIndex && std::abs(mean-expectedMean)<1e-5;
+              }
+            }
+            return false;
+          }
+          int main(){
+            G4ConvergenceTester t("repeat"),early("early"),direct("direct"),empty("empty");
+            check("empty history unavailable",history(empty).find("too small")!=std::string::npos);
+            double sum=0;
+            for(int i=0;i<128;++i){
+              double x=1+i%5;sum+=x;
+              t.AddScore(x);early.AddScore(x);direct.AddScore(x);
+              if(i==0)early.GetMean();
+            }
+            int a=count(report(t)),b=count(report(t)),c=count(report(t));
+            std::cout<<"repeat counts "<<a<<" "<<b<<" "<<c<<'\n';
+            check("repeat count unchanged",a>=0&&a<=8&&a==b&&b==c);
+            check("fresh direct history",lastRow(history(direct),127,sum/128));
+            early.GetMean();
+            check("early read then sufficient history",lastRow(history(early),127,sum/128));
+            check("mean control",std::abs(early.GetMean()-sum/128)<1e-12);
+            t.AddScore(5);sum+=5;
+            int d=count(report(t)),e=count(report(t));
+            std::cout<<"after new score "<<d<<" "<<e<<'\n';
+            check("new data report stable",d>=0&&d<=8&&d==e);
+            check("new data history current",lastRow(history(t),128,sum/129));
+            std::cout<<"SUMMARY PASS="<<pass<<" FAIL="<<fail<<'\n';
+            return fail?1:0;
+          }
+          CPP
+          printf '\nadd_executable(report_probe research-ci/report.cc)\ntarget_link_libraries(report_probe PRIVATE G4global)\n' >> CMakeLists.txt
+      - name: Build original and collect baseline
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGEANT4_INSTALL_DATA=OFF
+          cmake --build build --target report_probe --parallel 4
+          set +e
+          ./build/BuildProducts/bin/report_probe
+          rc=$?
+          set -e
+          test "$rc" -eq 1
+      - name: Evaluate minimal reporting-only correction
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("source/global/HEPNumerics/src/G4ConvergenceTester.cc")
+          s=p.read_text()
+          for a,b in [
+              ("  check_stat_history(out);", "  noPass = 0;\n  check_stat_history(out);"),
+              ("  if (history_grid[0] == 0)\n  {\n    showHistory = false;\n    return;\n  }", "  showHistory = history_grid[0] != 0;\n  if (!showHistory) return;"),
+              ("void G4ConvergenceTester::ShowHistory(std::ostream& out)\n{\n  if (!showHistory)", "void G4ConvergenceTester::ShowHistory(std::ostream& out)\n{\n  CheckIsUpdated();\n  if (n == 0 || !showHistory)")
+          ]:
+              assert s.count(a)==1, a
+              s=s.replace(a,b)
+          p.write_text(s)
+          PY
+          git diff --check
+          cmake --build build --target report_probe --parallel 4
+          ./build/BuildProducts/bin/report_probe
