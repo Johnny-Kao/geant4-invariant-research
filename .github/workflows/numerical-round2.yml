@@ -1,0 +1,81 @@
+name: Independent numerical round 2
+on:
+  push:
+    branches: [research/numerical-round2]
+    paths: ['.github/workflows/numerical-round2.yml']
+permissions:
+  contents: read
+jobs:
+  invariants:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare native probes
+        run: |
+          mkdir -p research-ci
+          cat > research-ci/round2.cc <<'CPP'
+          #include "G4ConvergenceTester.hh"
+          #include "G4DataInterpolation.hh"
+          #include "G4Physics2DVector.hh"
+          #include <algorithm>
+          #include <cmath>
+          #include <iostream>
+          #include <sstream>
+          #include <regex>
+          #include <string>
+          int pass=0,fail=0;
+          void check(const std::string& name,bool ok){
+            std::cout<<name<<" "<<(ok?"PASS":"FAIL")<<'\n';
+            (ok?pass:fail)++;
+          }
+          int count(const std::string& s){
+            std::smatch m;
+            return std::regex_search(s,m,std::regex("This result passes ([0-9]+) /"))?std::stoi(m[1]):-1;
+          }
+          int main(){
+            G4ConvergenceTester report("repeat"), early("early"), fresh("fresh");
+            early.AddScore(1);
+            early.GetMean();
+            fresh.AddScore(1);
+            for(int i=0;i<127;++i){
+              double x=1+(i%5);
+              report.AddScore(x); early.AddScore(x); fresh.AddScore(x);
+            }
+            report.AddScore(1);
+            std::ostringstream a,b,h1,h2;
+            report.ShowResult(a); report.ShowResult(b);
+            std::cout<<"repeat counts "<<count(a.str())<<" "<<count(b.str())<<'\n';
+            check("G4-06a repeated report invariant",count(a.str())>=0 && count(a.str())==count(b.str()));
+            early.ShowHistory(h1); fresh.ShowHistory(h2);
+            std::cout<<"early history header "<<h1.str().substr(0,90)<<"\nfresh history header "<<h2.str().substr(0,90)<<'\n';
+            check("G4-06b early-read history recovery",h1.str().find("Output History")!=std::string::npos && h2.str().find("Output History")!=std::string::npos);
+            check("G4-06 control mean",std::abs(early.GetMean()-fresh.GetMean())<1e-12);
+            double x[]={0,1,2,3,4}, y[]={0,1,0,3,1}, xr[]={4,3,2,1,0}, yr[]={1,3,0,1,0};
+            G4DataInterpolation asc(x,y,5,0.,0.),desc(xr,yr,5,0.,0.);
+            for(double t:{0.5,1.5,2.5,3.5}){
+              double u=asc.CubicSplineInterpolation(t),v=desc.CubicSplineInterpolation(t);
+              std::cout<<"order "<<t<<" "<<u<<" "<<v<<'\n';
+              check("G4-03 reversed nodes",std::abs(u-v)<1e-10);
+            }
+            G4Physics2DVector vec(3,3);
+            for(size_t i=0;i<3;++i){vec.PutX(i,double(i+1));vec.PutY(i,double(i+1));}
+            for(size_t j=0;j<3;++j)for(size_t i=0;i<3;++i)vec.PutValue(i,j,1.+2.*(i+1)+3.*(j+1)+4.*(i+1)*(j+1));
+            for(bool cubic:{false,true}){
+              vec.SetBicubicInterpolation(cubic);
+              for(double u:{1.25,1.75,2.25,2.75})for(double v:{1.25,1.75,2.25,2.75}){
+                size_t i=0,j=0;double actual=vec.Value(u,v,i,j),expected=1+2*u+3*v+4*u*v;
+                check(cubic?"G4-07 bicubic bilinear exactness":"G4-07 bilinear control",std::abs(actual-expected)<1e-10);
+              }
+            }
+            std::cout<<"SUMMARY PASS="<<pass<<" FAIL="<<fail<<'\n';
+            return fail?1:0;
+          }
+          CPP
+          printf '\nadd_executable(round2 research-ci/round2.cc)\ntarget_link_libraries(round2 PRIVATE G4global)\n' >> CMakeLists.txt
+      - name: Compile upstream G4global
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGEANT4_INSTALL_DATA=OFF
+          cmake --build build --target round2 --parallel 4
+      - name: Run invariants
+        run: ./build/round2
