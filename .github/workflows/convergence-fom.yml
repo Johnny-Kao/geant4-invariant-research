@@ -1,0 +1,97 @@
+name: Convergence FOM consistency
+on:
+  push:
+    branches: [research/numerical-round2]
+    paths: ['.github/workflows/convergence-fom.yml']
+permissions:
+  contents: read
+jobs:
+  fom:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare independent statistical reference
+        run: |
+          mkdir -p research-ci
+          cat > research-ci/fom.cc <<'CPP'
+          #include "G4ConvergenceTester.hh"
+          #include <cmath>
+          #include <ctime>
+          #include <iomanip>
+          #include <iostream>
+          #include <numeric>
+          #include <regex>
+          #include <sstream>
+          #include <vector>
+          double relativeError(const std::vector<double>& v){
+            double mean=std::accumulate(v.begin(),v.end(),0.)/v.size(), ss=0;
+            for(double x:v)ss+=(x-mean)*(x-mean);
+            return std::sqrt(ss/(v.size()-1)/v.size())/mean;
+          }
+          void burn(){
+            auto start=std::clock();volatile double x=0.1;
+            while(double(std::clock()-start)/CLOCKS_PER_SEC<0.12)
+              x=std::sin(x)+0.1;
+          }
+          double extract(const std::string& s,const char* name){
+            std::smatch m;
+            if(!std::regex_search(s,m,std::regex(std::string(name)+" = +([-+0-9.eE]+)")))return NAN;
+            return std::stod(m[1]);
+          }
+          bool near(double a,double b,double tol=2e-5){
+            return std::isfinite(a)&&std::isfinite(b)&&std::abs(a-b)<=tol*std::abs(b);
+          }
+          int main(){
+            int pass=0,fail=0,invalid=0;
+            std::cout<<std::setprecision(12);
+            for(double largest:{4.,20.,100.}){
+              G4ConvergenceTester t("FOM");
+              std::vector<double> v;
+              burn();
+              for(int i=0;i<127;++i){double x=1+i%3;v.push_back(x);t.AddScore(x);}
+              double rp=relativeError(v), fp=t.GetFOM(), tp=1/(fp*rp*rp);
+              burn();
+              t.AddScore(largest);v.push_back(largest);
+              double r=relativeError(v), f=t.GetFOM(), time=1/(f*r*r);
+              v.push_back(largest);
+              double r1=relativeError(v), expected=1/(r1*r1*(2*time-tp));
+              std::ostringstream out;t.ShowResult(out);
+              double actual=extract(out.str(),"Affected FOM"), shownR=extract(out.str(),"Affected R");
+              bool control=near(t.GetR(),r,1e-10)&&near(shownR,r1)&&std::isfinite(tp)&&tp>0&&time>tp;
+              if(!control){++invalid;std::cout<<"CONTROL INVALID\n";continue;}
+              bool ok=near(actual,expected);
+              (ok?pass:fail)++;
+              std::cout<<"largest="<<largest<<" R="<<r<<" affected_R="<<r1
+                <<" elapsed="<<time<<" added_elapsed="<<time-tp<<" original_FOM="<<f
+                <<" affected_FOM="<<actual<<" expected_FOM="<<expected
+                <<" relative_error_pct="<<100*(actual/expected-1)<<" "<<(ok?"PASS":"FAIL")<<"\n";
+            }
+            std::cout<<"SUMMARY PASS="<<pass<<" FAIL="<<fail<<" INVALID="<<invalid<<"\n";
+            return invalid?2:fail?1:0;
+          }
+          CPP
+          printf '\nadd_executable(fom_probe research-ci/fom.cc)\ntarget_link_libraries(fom_probe PRIVATE G4global)\n' >> CMakeLists.txt
+      - name: Original native calculation
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGEANT4_INSTALL_DATA=OFF
+          cmake --build build --target fom_probe --parallel 4
+          set +e
+          ./build/BuildProducts/bin/fom_probe
+          rc=$?
+          set -e
+          test "$rc" -eq 1
+      - name: Evaluate one-line formula correction
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("source/global/HEPNumerics/src/G4ConvergenceTester.cc")
+          s=p.read_text()
+          a="fom_1 = 1 / (r * r) / (cpu_time.back() + spend_time_of_largest);"
+          b="fom_1 = 1 / (r_1 * r_1) / (cpu_time.back() + spend_time_of_largest);"
+          assert s.count(a)==1
+          p.write_text(s.replace(a,b))
+          PY
+          git diff --check
+          cmake --build build --target fom_probe --parallel 4
+          ./build/BuildProducts/bin/fom_probe
