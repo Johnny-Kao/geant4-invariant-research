@@ -114,61 +114,19 @@ jobs:
           tar -xzf research-ci/data/ensdf.tar.gz -C research-ci/data
           test -d research-ci/data/G4ENSDFSTATE3.0
           echo "G4ENSDFSTATEDATA=$PWD/research-ci/data/G4ENSDFSTATE3.0" >> "$GITHUB_ENV"
-      - name: Original generator comparison
+      - name: Verify momentum-coordinate sampling
         run: |
           for mode in Lin Log Exp Spline; do
             for grid in positive zero; do
               # Log/Exp require strictly positive abscissae/densities for this comparison.
               if [[ "$grid" == zero && ( "$mode" == Log || "$mode" == Exp ) ]]; then continue; fi
-              echo "BASELINE $mode $grid"
+              echo "CHECK $mode $grid"
               set +e
               timeout 25 ./build/BuildProducts/bin/gps_probe "$mode" "$grid" > result.log 2>&1
               rc=$?
               set -e
               tail -n 8 result.log
-              echo "STATUS baseline $mode $grid $rc"
-            done
-          done
-      - name: Test research-only coordinate-preserving generation
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          p=Path("source/event/src/G4SPSEneDistribution.cc")
-          s=p.read_text()
-          # Keep interpolation and sampling in input coordinates, transform only returned Arb sample.
-          for fn in ["LinearInterpolation","LogInterpolation","ExpInterpolation","SplineInterpolation"]:
-              start=s.index("void G4SPSEneDistribution::"+fn+"()")
-              a=s.index("  if (!EnergySpec)",start)
-              b=s.index("\n  i = 1;",a)
-              assert "Arb_y[count] = Arb_y[count] * Arb_x[count] / total_energy;" in s[a:b]
-              s=s[:a]+s[b:]
-          a=s.index("G4double G4SPSEneDistribution::GenerateOne(")
-          b=s.index("G4double G4SPSEneDistribution::GetProbability(",a)
-          part=s[a:b]
-          old="  return params.particle_energy;\n}"
-          assert part.count(old)==1
-          new="""  if (EnergyDisType == "Arb" && !EnergySpec && !Biased)
-            {
-              const G4double p = params.particle_energy;
-              const G4double m = a->GetPDGMass();
-              return m == 0. ? p : p * (p / (std::hypot(p, m) + m));
-            }
-            return params.particle_energy;
-          }"""
-          s=s[:a]+part.replace(old,new)+s[b:]
-          p.write_text(s)
-          PY
-          cmake --build build --target gps_probe --parallel 4 > build.log 2>&1 || { tail -n 100 build.log; exit 1; }
-          for mode in Lin Log Exp Spline; do
-            for grid in positive zero; do
-              if [[ "$grid" == zero && ( "$mode" == Log || "$mode" == Exp ) ]]; then continue; fi
-              echo "CANDIDATE $mode $grid"
-              set +e
-              timeout 25 ./build/BuildProducts/bin/gps_probe "$mode" "$grid" > result.log 2>&1
-              rc=$?
-              set -e
-              tail -n 8 result.log
-              echo "STATUS candidate $mode $grid $rc"
+              echo "STATUS $mode $grid $rc"
               test "$rc" -eq 0
             done
           done
