@@ -1,0 +1,174 @@
+name: GPS coordinate consistency across interpolation modes
+on:
+  push:
+    branches: [research/g4-08-gps-momentum]
+    paths: ['.github/workflows/gps-coordinate-consistency.yml']
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare native source probe and independent CDF
+        run: |
+          mkdir -p research-ci
+          cat > research-ci/gps.cc <<'CPP'
+          #include "G4SPSEneDistribution.hh"
+          #include "G4SPSRandomGenerator.hh"
+          #include "G4Electron.hh"
+          #include "G4Gamma.hh"
+          #include "Randomize.hh"
+          #include <algorithm>
+          #include <cmath>
+          #include <iomanip>
+          #include <iostream>
+          #include <string>
+          #include <vector>
+          using V=std::vector<double>;
+          constexpr int N=50000;
+          double kinetic(double p,double m){
+            return m==0?p:p*p/(std::hypot(p,m)+m);
+          }
+          V sample(G4ParticleDefinition* particle,bool energy,const V& x,const V& y,const std::string& mode){
+            G4SPSRandomGenerator rng;
+            G4SPSEneDistribution dist;
+            dist.SetBiasRndm(&rng);
+            dist.GenerateOne(particle);
+            dist.SetEnergyDisType("Arb");
+            dist.InputEnergySpectra(energy);
+            dist.InputDifferentialSpectra(true);
+            for(size_t i=0;i<x.size();++i)dist.ArbEnergyHisto(G4ThreeVector(x[i],y[i],0));
+            dist.ArbInterpolate(mode);
+            G4Random::setTheSeed(123456);
+            V v;v.reserve(N);
+            for(int i=0;i<N;++i)v.push_back(dist.GenerateOne(particle));
+            return v;
+          }
+          int main(int argc,char** argv){
+            if(argc!=3)return 2;
+            std::string mode=argv[1],grid=argv[2];
+            bool zero=grid=="zero";
+            V x,y;
+            for(int i=0;i<=10;++i){
+              x.push_back((i+(zero?0:1))/10.);
+              y.push_back(1.+i*.1);
+            }
+            if(zero&&mode=="Lin")y={0,1,2,3,2,1,1,2,3,4,5};
+            auto* particle=G4Electron::ElectronDefinition();
+            double m=particle->GetPDGMass();
+            V ref=sample(particle,true,x,y,mode);
+            V got=sample(particle,false,x,y,mode);
+            int invalid=0,controlInvalid=0,low=0;
+            double sumRef=0,sumGot=0,maxPair=0,maxCDF=0;
+            double lo=kinetic(x.front(),m),hi=kinetic(x.back(),m);
+            for(int i=0;i<N;++i){
+              if(!std::isfinite(ref[i])||ref[i]<x.front()-1e-10||ref[i]>x.back()+1e-10)++controlInvalid;
+              ref[i]=kinetic(ref[i],m);
+              if(!std::isfinite(got[i])||got[i]<lo-1e-10||got[i]>hi+1e-10)++invalid;
+              if(got[i]<x.front())++low;
+              sumRef+=ref[i];sumGot+=got[i];
+              maxPair=std::max(maxPair,std::abs(ref[i]-got[i]));
+            }
+            auto sortedRef=ref,sortedGot=got;
+            std::sort(sortedRef.begin(),sortedRef.end());std::sort(sortedGot.begin(),sortedGot.end());
+            for(size_t j=1;j+1<x.size();++j){
+              double e=kinetic(x[j],m);
+              double a=double(std::upper_bound(sortedRef.begin(),sortedRef.end(),e)-sortedRef.begin())/N;
+              double b=double(std::upper_bound(sortedGot.begin(),sortedGot.end(),e)-sortedGot.begin())/N;
+              maxCDF=std::max(maxCDF,std::abs(a-b));
+            }
+            std::cout<<std::setprecision(12)<<"RESULT mode="<<mode<<" grid="<<grid<<" samples="<<N
+              <<" invalid="<<invalid<<" control_invalid="<<controlInvalid<<" max_cdf_diff="<<maxCDF
+              <<" expected_mean="<<sumRef/N<<" observed_mean="<<sumGot/N
+              <<" mean_bias_pct="<<100*(sumGot/sumRef-1)<<" max_paired_delta="<<maxPair
+              <<" count_below_input_momentum_min="<<low<<"\n";
+            if(controlInvalid)return 2;
+            return invalid||maxCDF>0.008?1:0;
+          }
+          CPP
+          cat >> CMakeLists.txt <<'CMAKE'
+          # Compile the unmodified production GPS numerical sources, without a full transport build.
+          file(GLOB_RECURSE gps_headers CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/source/*.hh" "${CMAKE_SOURCE_DIR}/source/*.icc")
+          set(gps_includes "")
+          foreach(h IN LISTS gps_headers)
+            get_filename_component(d "${h}" DIRECTORY)
+            list(APPEND gps_includes "${d}")
+          endforeach()
+          list(REMOVE_DUPLICATES gps_includes)
+          add_executable(gps_probe research-ci/gps.cc source/event/src/G4SPSEneDistribution.cc source/event/src/G4SPSRandomGenerator.cc)
+          target_include_directories(gps_probe PRIVATE ${gps_includes})
+          target_link_libraries(gps_probe PRIVATE G4particles G4global G4intercoms)
+          CMAKE
+      - name: Build native GPS source and particle library
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGEANT4_INSTALL_DATA=OFF
+          cmake --build build --target gps_probe --parallel 4 > build.log 2>&1 || { tail -n 100 build.log; exit 1; }
+          tail -n 8 build.log
+      - name: Install required official particle dataset
+        run: |
+          mkdir -p research-ci/data
+          curl -fLsS --retry 3 https://cern.ch/geant4-data/datasets/G4ENSDFSTATE.3.0.tar.gz -o research-ci/data/ensdf.tar.gz
+          echo 'c500728534ce3e9fb2fefa0112eb3a74  research-ci/data/ensdf.tar.gz' | md5sum -c -
+          tar -xzf research-ci/data/ensdf.tar.gz -C research-ci/data
+          test -d research-ci/data/G4ENSDFSTATE3.0
+          echo "G4ENSDFSTATEDATA=$PWD/research-ci/data/G4ENSDFSTATE3.0" >> "$GITHUB_ENV"
+      - name: Original generator comparison
+        run: |
+          for mode in Lin Log Exp Spline; do
+            for grid in positive zero; do
+              # Log/Exp require strictly positive abscissae/densities for this comparison.
+              if [[ "$grid" == zero && ( "$mode" == Log || "$mode" == Exp ) ]]; then continue; fi
+              echo "BASELINE $mode $grid"
+              set +e
+              timeout 25 ./build/BuildProducts/bin/gps_probe "$mode" "$grid" > result.log 2>&1
+              rc=$?
+              set -e
+              tail -n 8 result.log
+              echo "STATUS baseline $mode $grid $rc"
+            done
+          done
+      - name: Test research-only coordinate-preserving generation
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("source/event/src/G4SPSEneDistribution.cc")
+          s=p.read_text()
+          # Keep interpolation and sampling in input coordinates, transform only returned Arb sample.
+          for fn in ["LinearInterpolation","LogInterpolation","ExpInterpolation","SplineInterpolation"]:
+              start=s.index("void G4SPSEneDistribution::"+fn+"()")
+              a=s.index("  if (!EnergySpec)",start)
+              b=s.index("\n  i = 1;",a)
+              assert "Arb_y[count] = Arb_y[count] * Arb_x[count] / total_energy;" in s[a:b]
+              s=s[:a]+s[b:]
+          a=s.index("G4double G4SPSEneDistribution::GenerateOne(")
+          b=s.index("G4double G4SPSEneDistribution::GetProbability(",a)
+          part=s[a:b]
+          old="  return params.particle_energy;\n}"
+          assert part.count(old)==1
+          new="""  if (EnergyDisType == "Arb" && !EnergySpec && !Biased)
+            {
+              const G4double p = params.particle_energy;
+              const G4double m = a->GetPDGMass();
+              return m == 0. ? p : p * (p / (std::hypot(p, m) + m));
+            }
+            return params.particle_energy;
+          }"""
+          s=s[:a]+part.replace(old,new)+s[b:]
+          p.write_text(s)
+          PY
+          cmake --build build --target gps_probe --parallel 4 > build.log 2>&1 || { tail -n 100 build.log; exit 1; }
+          for mode in Lin Log Exp Spline; do
+            for grid in positive zero; do
+              if [[ "$grid" == zero && ( "$mode" == Log || "$mode" == Exp ) ]]; then continue; fi
+              echo "CANDIDATE $mode $grid"
+              set +e
+              timeout 25 ./build/BuildProducts/bin/gps_probe "$mode" "$grid" > result.log 2>&1
+              rc=$?
+              set -e
+              tail -n 8 result.log
+              echo "STATUS candidate $mode $grid $rc"
+              test "$rc" -eq 0
+            done
+          done
