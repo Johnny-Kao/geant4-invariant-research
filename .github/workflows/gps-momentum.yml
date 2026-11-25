@@ -106,6 +106,14 @@ jobs:
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGEANT4_INSTALL_DATA=OFF
           cmake --build build --target gps_probe --parallel 4 > build.log 2>&1 || { tail -n 100 build.log; exit 1; }
           tail -n 8 build.log
+      - name: Install required official particle dataset
+        run: |
+          mkdir -p research-ci/data
+          curl -fLsS --retry 3 https://cern.ch/geant4-data/datasets/G4ENSDFSTATE.3.0.tar.gz -o research-ci/data/ensdf.tar.gz
+          echo 'c500728534ce3e9fb2fefa0112eb3a74  research-ci/data/ensdf.tar.gz' | md5sum -c -
+          tar -xzf research-ci/data/ensdf.tar.gz -C research-ci/data
+          test -d research-ci/data/G4ENSDFSTATE3.0
+          echo "G4ENSDFSTATEDATA=$PWD/research-ci/data/G4ENSDFSTATE3.0" >> "$GITHUB_ENV"
       - name: Compare sampled distributions
         run: |
           set +e
