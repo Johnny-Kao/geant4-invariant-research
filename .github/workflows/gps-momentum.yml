@@ -72,7 +72,7 @@ jobs:
             }
             std::cout<<"RESULT "<<label<<" samples="<<N<<" invalid="<<invalid
               <<" max_ref_error="<<maxRef<<" max_source_error="<<maxCurrent<<'\n';
-            if(invalid)return 2;
+            if(invalid||maxCurrent>0.008)return 2;
             // Distinguish a numerical mismatch from random sampling variation.
             return maxRef>0.008?1:0;
           }
@@ -81,7 +81,8 @@ jobs:
             V x,y{0,1,2,3,2,1,1,2,3,4,5};
             for(int i=0;i<=10;++i)x.push_back(i/10.);
             int control=sample("energy_control",G4Electron::ElectronDefinition(),true,x,y);
-            int massless=sample("massless_control",G4Gamma::GammaDefinition(),false,x,y);
+            V positive=x; for(auto& p:positive)p+=0.1;
+            int massless=sample("massless_positive_control",G4Gamma::GammaDefinition(),false,positive,y);
             int massive=sample("official_test27_momentum",G4Electron::ElectronDefinition(),false,x,y);
             std::cout<<"SUMMARY controls="<<control<<","<<massless<<" massive="<<massive<<'\n';
             if(control||massless||massive==2)return 2;
