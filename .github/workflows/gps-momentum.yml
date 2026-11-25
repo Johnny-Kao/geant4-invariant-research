@@ -1,0 +1,116 @@
+name: GPS momentum distribution conservation
+on:
+  push:
+    branches: [research/g4-08-gps-momentum]
+    paths: ['.github/workflows/gps-momentum.yml']
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare native source probe and independent CDF
+        run: |
+          mkdir -p research-ci
+          cat > research-ci/gps.cc <<'CPP'
+          #include "G4SPSEneDistribution.hh"
+          #include "G4SPSRandomGenerator.hh"
+          #include "G4Electron.hh"
+          #include "G4Gamma.hh"
+          #include "Randomize.hh"
+          #include <cmath>
+          #include <iomanip>
+          #include <iostream>
+          #include <vector>
+          #include <algorithm>
+          #include <numeric>
+          using V=std::vector<double>;
+          constexpr int N=100000;
+          V cdf(const V& x,const V& y){
+            V result(x.size(),0);
+            for(size_t i=1;i<x.size();++i)
+              result[i]=result[i-1]+(x[i]-x[i-1])*(y[i]+y[i-1])/2;
+            double total=result.back();for(auto& v:result)v/=total;
+            return result;
+          }
+          int sample(const char* label,G4ParticleDefinition* particle,bool energy,const V& x,const V& y){
+            G4SPSRandomGenerator rng;
+            G4SPSEneDistribution dist;
+            dist.SetBiasRndm(&rng);
+            // Establish particle context through the documented public generation API.
+            dist.GenerateOne(particle);
+            dist.SetEnergyDisType("Arb");
+            dist.InputEnergySpectra(energy);
+            dist.InputDifferentialSpectra(true);
+            for(size_t i=0;i<x.size();++i)dist.ArbEnergyHisto(G4ThreeVector(x[i],y[i],0));
+            dist.ArbInterpolate("Lin");
+            double m=particle->GetPDGMass();
+            V k=x,w=y;
+            if(!energy)for(size_t i=0;i<x.size();++i){
+              double total=std::hypot(x[i],m);
+              k[i]=total-m;
+              if(total>0)w[i]=y[i]*x[i]/total;
+            }
+            V expected=cdf(x,y), current=cdf(k,w);
+            std::vector<int> counts(k.size(),0);
+            int invalid=0;
+            G4Random::setTheSeed(123456);
+            for(int i=0;i<N;++i){
+              double e=dist.GenerateOne(particle);
+              if(!std::isfinite(e)||e<k.front()-1e-10||e>k.back()+1e-10){++invalid;continue;}
+              for(size_t j=1;j<k.size();++j)if(e<=k[j])++counts[j];
+            }
+            double maxRef=0,maxCurrent=0;
+            for(size_t j=1;j+1<k.size();++j){
+              double observed=double(counts[j])/N;
+              maxRef=std::max(maxRef,std::abs(observed-expected[j]));
+              maxCurrent=std::max(maxCurrent,std::abs(observed-current[j]));
+              std::cout<<label<<" knot="<<j<<" energy="<<k[j]<<" expected="<<expected[j]
+                <<" observed="<<observed<<" source_cdf="<<current[j]<<'\n';
+            }
+            std::cout<<"RESULT "<<label<<" samples="<<N<<" invalid="<<invalid
+              <<" max_ref_error="<<maxRef<<" max_source_error="<<maxCurrent<<'\n';
+            if(invalid)return 2;
+            // Distinguish a numerical mismatch from random sampling variation.
+            return maxRef>0.008?1:0;
+          }
+          int main(){
+            std::cout<<std::setprecision(10);
+            V x,y{0,1,2,3,2,1,1,2,3,4,5};
+            for(int i=0;i<=10;++i)x.push_back(i/10.);
+            int control=sample("energy_control",G4Electron::ElectronDefinition(),true,x,y);
+            int massless=sample("massless_control",G4Gamma::GammaDefinition(),false,x,y);
+            int massive=sample("official_test27_momentum",G4Electron::ElectronDefinition(),false,x,y);
+            std::cout<<"SUMMARY controls="<<control<<","<<massless<<" massive="<<massive<<'\n';
+            if(control||massless||massive==2)return 2;
+            return massive;
+          }
+          CPP
+          cat >> CMakeLists.txt <<'CMAKE'
+          # Compile the unmodified production GPS numerical sources, without a full transport build.
+          file(GLOB_RECURSE gps_headers CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/source/*.hh" "${CMAKE_SOURCE_DIR}/source/*.icc")
+          set(gps_includes "")
+          foreach(h IN LISTS gps_headers)
+            get_filename_component(d "${h}" DIRECTORY)
+            list(APPEND gps_includes "${d}")
+          endforeach()
+          list(REMOVE_DUPLICATES gps_includes)
+          add_executable(gps_probe research-ci/gps.cc source/event/src/G4SPSEneDistribution.cc source/event/src/G4SPSRandomGenerator.cc)
+          target_include_directories(gps_probe PRIVATE ${gps_includes})
+          target_link_libraries(gps_probe PRIVATE G4particles G4global G4intercoms)
+          CMAKE
+      - name: Build native GPS source and particle library
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGEANT4_INSTALL_DATA=OFF
+          cmake --build build --target gps_probe --parallel 4 > build.log 2>&1 || { tail -n 100 build.log; exit 1; }
+          tail -n 8 build.log
+      - name: Compare sampled distributions
+        run: |
+          set +e
+          timeout 90 ./build/BuildProducts/bin/gps_probe
+          rc=$?
+          set -e
+          echo "Probe exit=$rc (1=observed distribution mismatch, 2=invalid control)"
+          test "$rc" -eq 1
